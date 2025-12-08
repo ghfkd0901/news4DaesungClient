@@ -4,7 +4,7 @@ import html
 import pandas as pd
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 # --- 1. 페이지 설정 ---
@@ -32,6 +32,13 @@ st.markdown("""
         .news-date { font-size: 12px; color: #7f8c8d; margin-bottom: 12px; display: block; }
         div[data-testid="stCheckbox"] { margin-top: 5px; margin-bottom: 5px; }
         hr { margin-top: 1rem; margin-bottom: 2rem; border-color: #eee; }
+        
+        /* 라디오 버튼 스타일 개선 */
+        div.row-widget.stRadio > div { flex-direction: row; align-items: stretch; }
+        div.row-widget.stRadio > div[role="radiogroup"] > label {
+            background-color: #f0f2f6; padding: 4px 10px; border-radius: 15px;
+            margin-right: 4px; border: 1px solid #e0e0e0;
+        }
         
         /* 결과 없음 메시지 스타일 */
         .no-result {
@@ -68,6 +75,38 @@ def format_slack_date(date_str):
     except:
         return date_str[:16]
 
+def is_date_in_range(date_str, range_option):
+    """
+    뉴스 날짜가 선택된 기간 내에 있는지 확인하는 함수
+    """
+    if range_option == "전체":
+        return True
+        
+    try:
+        # 네이버 날짜 포맷 파싱
+        news_dt = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
+        news_dt = news_dt.replace(tzinfo=None)
+        now = datetime.now()
+        
+        # [수정됨] 1일 선택 시: 오늘 0시 0분 0초부터 현재까지로 제한 (오늘 뉴스만)
+        if range_option == "1일":
+            cutoff_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            # 나머지 기간: 기존과 동일하게 타임델타 적용
+            days_map = {
+                "3일": 3,
+                "1주일": 7,
+                "1개월": 30,
+                "6개월": 180,
+                "1년": 365
+            }
+            delta = days_map.get(range_option, 36500)
+            cutoff_date = now - timedelta(days=delta)
+        
+        return news_dt >= cutoff_date
+    except:
+        return True
+
 @st.cache_data(ttl=600)
 def load_top_customers_data():
     sheet_id = "1uneDYeTtVztafjrzXGiym94Ux6C0gJEHLkE41_0s4dE"
@@ -89,10 +128,10 @@ def clean_company_name(name):
     return name.strip()
 
 # --- 5. API 및 슬랙 함수 ---
-def get_naver_news(query):
+def get_naver_news(query, display_count=10):
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {"X-Naver-Client-Id": NAVER_ID, "X-Naver-Client-Secret": NAVER_SECRET}
-    params = {"query": query, "display": 3, "sort": "date"}
+    params = {"query": query, "display": display_count, "sort": "date"}
     try:
         res = requests.get(url, headers=headers, params=params)
         return res.json().get('items', []) if res.status_code == 200 else []
@@ -166,6 +205,16 @@ with st.sidebar:
     st.markdown("---")
     
     top_n = st.slider("📊 검색 대상 기업 수", 1, total_customers, total_customers)
+    
+    # [New] 날짜 범위 선택 기능 (라디오 버튼)
+    st.markdown("<b>📅 뉴스 기간 선택</b>", unsafe_allow_html=True)
+    date_options = ["1일", "3일", "1주일", "1개월", "6개월", "1년", "전체"]
+    
+    # [수정됨] 기본값 index=0 (1일)로 변경
+    selected_date_range = st.radio("기간 선택", date_options, index=0, horizontal=True, label_visibility="collapsed")
+    
+    st.markdown("<div style='margin-bottom: 10px;'></div>", unsafe_allow_html=True)
+    
     api_filter_word = st.text_input("🏷️ 수집 키워드 (API)", placeholder="예: 화재, 수주 (빈칸이면 전체)")
     
     st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
@@ -186,14 +235,21 @@ with st.sidebar:
             progress_text.text(f"📡 수집 중... {raw_name} ({idx+1}/{len(target_list)})")
             
             if len(search_name) >= 2:
-                items = get_naver_news(search_name)
+                # 기간 필터링을 위해 넉넉히 15개를 가져옴
+                items = get_naver_news(search_name, display_count=15)
                 valid_items = []
                 filter_keywords = [k.strip() for k in api_filter_word.split(',')] if api_filter_word else []
                 
                 for item in items:
                     title = html.unescape(item['title'].replace("<b>", "").replace("</b>", ""))
                     desc = html.unescape(item['description'].replace("<b>", "").replace("</b>", ""))
+                    pub_date = item['pubDate']
                     
+                    # 0. 날짜 필터링 적용
+                    if not is_date_in_range(pub_date, selected_date_range):
+                        continue
+
+                    # 1. API 키워드 필터링 적용
                     if filter_keywords:
                         if not any(key in title or key in desc for key in filter_keywords):
                             continue 
@@ -206,8 +262,9 @@ with st.sidebar:
                         "desc": desc
                     })
                 
+                # 결과가 있을 때만 저장 (표시 갯수 제한: 최대 3개만 보여주기)
                 if valid_items:
-                    results[raw_name] = valid_items
+                    results[raw_name] = valid_items[:3] 
             
             bar.progress((idx + 1) / len(target_list))
             time.sleep(0.05)
@@ -224,7 +281,6 @@ with st.sidebar:
     current_selection = len(st.session_state['selected_ids'])
     st.info(f"현재 **{current_selection}건** 선택됨")
     
-    # 선택된 건수가 없으면 버튼 비활성화 (disabled=True)
     if st.button("📨 슬랙으로 전송하기", type="primary", use_container_width=True, disabled=(current_selection == 0)):
         with st.spinner("메시지를 보내고 있습니다..."):
             final_selected_items = []
@@ -249,14 +305,12 @@ with st.sidebar:
 
     # 3. 슬랙 채널 바로가기 (상시 노출)
     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-    # [수정됨] 사용자가 요청한 직관적인 멘트로 변경
     st.link_button("📢 마케팅팀 슬랙 #뉴스 채널로 이동하기", "https://w1720603775-rgf723937.slack.com/archives/C0A22RMU3UH", use_container_width=True)
 
 
 # ==========================================
 # [메인 콘텐츠 영역]
 # ==========================================
-# 결과 내 재검색 기능
 st.divider()
 st.subheader("🔍 결과 내 필터링")
 local_filter = st.text_input("결과 안에서 찾기", placeholder="예: 사망, 계약")
@@ -286,7 +340,7 @@ elif not display_results:
     st.warning(f"😥 '{local_filter}'에 해당하는 검색 결과가 없습니다.")
 
 else:
-    # 컨트롤 패널 (전체 선택 등)
+    # 컨트롤 패널
     with st.container(border=True):
         c1, c2, c3 = st.columns([0.2, 0.6, 0.2])
         
